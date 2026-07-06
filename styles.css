@@ -1,0 +1,6 @@
+/* Base Cover Image Generator — settings tweaks */
+.base-cover-image-prompt textarea {
+	width: 100%;
+	min-height: 6em;
+	font-family: var(--font-monospace);
+}
