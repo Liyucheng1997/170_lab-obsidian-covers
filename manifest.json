@@ -1,9 +1,9 @@
 {
 	"id": "base-cover-image",
 	"name": "Base Cover Image Generator",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"minAppVersion": "1.9.0",
-	"description": "Generate cover images for your Base card notes using Google's Gemini Nano Banana image models, and write them into the cover property as a link so they show up in Bases.",
+	"description": "Generate cover images for your Base card notes using Google's Gemini Nano Banana image models, or find existing book covers, film posters and portraits on Douban / Wikipedia, and write them into the cover property as a link so they show up in Bases.",
 	"author": "tikitalia",
 	"isDesktopOnly": false
 }

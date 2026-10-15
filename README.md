@@ -13,6 +13,9 @@ property as a link so it shows up as the card cover in Bases.
 - **Right-click** a note (File Explorer / editor) to generate or **regenerate** the cover.
 - **Right-click a folder** to batch-generate covers for every note (optionally only
   notes that don't have one yet).
+- **Find real covers on the web** for book, movie/TV and person notes: searches
+  **Douban** (豆瓣读书 / 豆瓣电影) by note name, with **Wikipedia** as a fallback,
+  downloads the image into your vault and links it in `cover`. No API key needed.
 
 ## Install into your vault
 
@@ -52,6 +55,40 @@ Open **Settings → Base Cover Image Generator**:
 
 The generated link lands in the `cover` property. Point your Base card view's image
 property at `cover` and the covers appear on the cards.
+
+## Web covers (Douban / Wikipedia)
+
+For notes about things that already have a cover — books, films, TV series, people —
+you can fetch the real image instead of generating one.
+
+- **Right-click a note** → *Find cover on the web (Douban / Wikipedia)*, or run the
+  command of the same name. A picker shows the results as thumbnails; you can edit the
+  search text or type and search again, then click the image you want.
+- **Right-click a folder** → *Find covers on the web for notes missing one*.
+- **Right-click a `.base` file** → *Find covers on the web for notes in this Base
+  (missing one)*, or run the command while the Base is open.
+
+Batch runs pick the best result automatically. With *Batch: only accept matching
+titles* on (the default), a note is skipped when no result's title matches its name,
+so you don't end up with a wrong cover. Skipped notes can be done one by one with
+the picker.
+
+**What gets searched.** The note name, with a `【书籍】`-style prefix and `《》`
+removed (configurable regex). You can add properties, e.g. `{{title}} {{prop:author}}`.
+
+**Book, movie or person?** The plugin reads the type property (default `类型`), the
+note's tags and a `【…】` name prefix, and matches them against keyword lists
+(e.g. `书籍` → book, `电影`/`电视剧`/`纪录片` → movie, `人物` → person). If nothing
+matches it searches all categories.
+
+**Sources.** Douban covers books, movies, TV and many people (including historical
+and literary figures). Wikipedia (`zh`, then `en` by default) is only asked when
+Douban has no matching result — useful for historical figures like 曹操. Douban
+images require a douban.com Referer, which the plugin sends; on desktop it falls back
+to Node's HTTP client if Obsidian's request API can't send it.
+
+Keep *Batch: parallel requests* low and the delay at ~1 s — both Douban and
+Wikipedia block clients that send requests too quickly.
 
 ## How the cover value is formatted
 

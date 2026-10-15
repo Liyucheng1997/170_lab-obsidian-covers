@@ -14,6 +14,16 @@ import {
 	parseYaml,
 	requestUrl,
 } from "obsidian";
+import {
+	CoverCandidate,
+	CoverPickerModal,
+	KIND_LABELS,
+	MediaKind,
+	SearchOptions,
+	downloadImage,
+	pickBest,
+	searchCovers,
+} from "./web-cover";
 
 /* ------------------------------------------------------------------ */
 /*  Settings                                                           */
@@ -38,6 +48,28 @@ interface CoverImageSettings {
 	useEmbed: boolean;
 	/** How many images to generate at once during batch runs. */
 	concurrency: number;
+
+	/* ---- Web cover search (Douban / Wikipedia) ---- */
+	useDouban: boolean;
+	useWikipedia: boolean;
+	/** Comma-separated Wikipedia language editions, tried in order. */
+	wikiLangs: string;
+	/** Frontmatter property that says what a note is (book / movie / person). */
+	typeProperty: string;
+	bookKeywords: string;
+	movieKeywords: string;
+	personKeywords: string;
+	/** Search text. Supports {{title}} (cleaned note name) and {{prop:name}}. */
+	searchTemplate: string;
+	/** Regex removed from the note name to build {{title}}. */
+	titleCleanup: string;
+	/** Single note: show a picker with all results instead of taking the best. */
+	webPickManually: boolean;
+	/** Batch: skip notes whose results don't match the title. */
+	webStrictMatch: boolean;
+	/** Batch: delay between requests per worker, to be polite to Douban. */
+	webInterval: number;
+	webConcurrency: number;
 }
 
 const DEFAULT_SETTINGS: CoverImageSettings = {
@@ -58,6 +90,20 @@ const DEFAULT_SETTINGS: CoverImageSettings = {
 	contentLength: 800,
 	useEmbed: false,
 	concurrency: 3,
+
+	useDouban: true,
+	useWikipedia: true,
+	wikiLangs: "zh, en",
+	typeProperty: "类型",
+	bookKeywords: "书籍, 书, 小说, book",
+	movieKeywords: "电影, 电视剧, 纪录片, 动画, 动漫, 综艺, movie, tv, film",
+	personKeywords: "人物, 皇帝, 作家, 演员, person, people",
+	searchTemplate: "{{title}}",
+	titleCleanup: "^【[^】]*】\\s*|[《》]",
+	webPickManually: true,
+	webStrictMatch: true,
+	webInterval: 1200,
+	webConcurrency: 2,
 };
 
 /* ------------------------------------------------------------------ */
@@ -100,6 +146,28 @@ export default class CoverImagePlugin extends Plugin {
 				const file = this.app.workspace.getActiveFile();
 				if (!file || file.extension !== "md") return false;
 				if (!checking) this.generateCover(file, true);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "fetch-web-cover-active",
+			name: "Find cover on the web (Douban / Wikipedia) for the current note",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				if (!checking) this.fetchWebCover(file);
+				return true;
+			},
+		});
+
+		this.addCommand({
+			id: "fetch-web-covers-active-base",
+			name: "Find covers on the web for notes in the active Base (missing one)",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "base") return false;
+				if (!checking) this.fetchForBase(file);
 				return true;
 			},
 		});
@@ -174,6 +242,12 @@ export default class CoverImagePlugin extends Plugin {
 					.setIcon("image-plus")
 					.onClick(() => this.generateForBase(file, false))
 			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Find covers on the web for notes in this Base (missing one)")
+					.setIcon("globe")
+					.onClick(() => this.fetchForBase(file))
+			);
 		} else if (file instanceof TFile && file.extension === "md") {
 			this.addNoteMenuItems(menu, file);
 		} else if (file instanceof TFolder) {
@@ -189,6 +263,12 @@ export default class CoverImagePlugin extends Plugin {
 					.setIcon("image-plus")
 					.onClick(() => this.generateForFolder(file, true))
 			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Find covers on the web for notes missing one")
+					.setIcon("globe")
+					.onClick(() => this.fetchForFolder(file))
+			);
 		}
 	}
 
@@ -199,6 +279,12 @@ export default class CoverImagePlugin extends Plugin {
 				.setTitle(hasCover ? "Regenerate cover image" : "Generate cover image")
 				.setIcon("image-plus")
 				.onClick(() => this.generateCover(file, hasCover))
+		);
+		menu.addItem((item) =>
+			item
+				.setTitle("Find cover on the web (Douban / Wikipedia)")
+				.setIcon("globe")
+				.onClick(() => this.fetchWebCover(file))
 		);
 	}
 
@@ -211,6 +297,24 @@ export default class CoverImagePlugin extends Plugin {
 	/* -------------------------- generation ---------------------------- */
 
 	async generateForFolder(folder: TFolder, onlyMissing: boolean) {
+		const notes = this.collectFolderNotes(folder, onlyMissing);
+		if (notes.length === 0) {
+			new Notice("No matching notes found in this folder.");
+			return;
+		}
+		await this.runBatch(notes, folder.name, (n) => this.generateCover(n, false, true));
+	}
+
+	async fetchForFolder(folder: TFolder) {
+		const notes = this.collectFolderNotes(folder, true);
+		if (notes.length === 0) {
+			new Notice("No notes without a cover in this folder.");
+			return;
+		}
+		await this.runWebBatch(notes, folder.name);
+	}
+
+	private collectFolderNotes(folder: TFolder, onlyMissing: boolean): TFile[] {
 		const notes: TFile[] = [];
 		const walk = (f: TAbstractFile) => {
 			if (f instanceof TFile && f.extension === "md") {
@@ -220,22 +324,38 @@ export default class CoverImagePlugin extends Plugin {
 			}
 		};
 		folder.children.forEach(walk);
-
-		if (notes.length === 0) {
-			new Notice("No matching notes found in this folder.");
-			return;
-		}
-		await this.runBatch(notes, folder.name);
+		return notes;
 	}
 
 	/** Resolve the notes a .base file selects, then generate covers for them. */
 	async generateForBase(baseFile: TFile, onlyMissing: boolean) {
+		const targets = await this.resolveBaseNotes(baseFile, onlyMissing);
+		if (!targets) return;
+		await this.runBatch(targets, baseFile.basename, (n) =>
+			this.generateCover(n, false, true)
+		);
+	}
+
+	async fetchForBase(baseFile: TFile) {
+		const targets = await this.resolveBaseNotes(baseFile, true);
+		if (!targets) return;
+		await this.runWebBatch(targets, baseFile.basename);
+	}
+
+	/**
+	 * Notes a .base file selects (optionally only those without a cover).
+	 * Returns null — after telling the user why — when there is nothing to do.
+	 */
+	private async resolveBaseNotes(
+		baseFile: TFile,
+		onlyMissing: boolean
+	): Promise<TFile[] | null> {
 		let config: any;
 		try {
 			config = parseYaml(await this.app.vault.cachedRead(baseFile));
 		} catch (e) {
 			new Notice("Could not read this Base file.");
-			return;
+			return null;
 		}
 
 		const topFilter = config?.filters ?? null;
@@ -246,7 +366,7 @@ export default class CoverImagePlugin extends Plugin {
 		let viewFilters: any[];
 		if (views.length > 1) {
 			const choice = await this.pickView(views);
-			if (choice === undefined) return; // cancelled
+			if (choice === undefined) return null; // cancelled
 			viewFilters =
 				choice === "ALL"
 					? views.map((v) => v?.filters).filter((f) => f != null)
@@ -273,9 +393,9 @@ export default class CoverImagePlugin extends Plugin {
 					? "No notes matched this Base's filters."
 					: "All notes already have a cover."
 			);
-			return;
+			return null;
 		}
-		await this.runBatch(targets, baseFile.basename);
+		return targets;
 	}
 
 	/** Pop a picker to choose a single view or the whole Base. */
@@ -287,31 +407,49 @@ export default class CoverImagePlugin extends Plugin {
 		});
 	}
 
-	/** Run generation over many notes with a bounded concurrency pool. */
-	private async runBatch(notes: TFile[], label: string) {
+	/** Run a job over many notes with a bounded concurrency pool. */
+	private async runBatch(
+		notes: TFile[],
+		label: string,
+		job: (note: TFile) => Promise<boolean>,
+		concurrency = this.settings.concurrency,
+		verb = "Generating",
+		delayMs = 0
+	) {
 		const total = notes.length;
-		const workers = Math.max(1, Math.min(this.settings.concurrency || 1, total));
+		const workers = Math.max(1, Math.min(concurrency || 1, total));
 		let ok = 0;
 		let done = 0;
 		let next = 0;
 
-		const progress = new Notice(`Generating covers (0/${total})…`, 0);
-		const tick = () =>
-			progress.setMessage(`Generating covers (${done}/${total})…`);
+		const progress = new Notice(`${verb} covers (0/${total})…`, 0);
+		const tick = () => progress.setMessage(`${verb} covers (${done}/${total})…`);
 
 		const worker = async () => {
 			while (next < total) {
 				const note = notes[next++];
-				const success = await this.generateCover(note, false, true);
+				const success = await job(note);
 				done++;
 				if (success) ok++;
 				tick();
+				if (delayMs > 0 && next < total) await sleep(delayMs);
 			}
 		};
 
 		await Promise.all(Array.from({ length: workers }, () => worker()));
 		progress.hide();
-		new Notice(`Done "${label}": ${ok}/${total} cover(s) generated.`, 6000);
+		new Notice(`Done "${label}": ${ok}/${total} cover(s) set.`, 6000);
+	}
+
+	private runWebBatch(notes: TFile[], label: string) {
+		return this.runBatch(
+			notes,
+			label,
+			(n) => this.fetchWebCover(n, true),
+			this.settings.webConcurrency,
+			"Fetching",
+			this.settings.webInterval
+		);
 	}
 
 	/**
@@ -357,6 +495,137 @@ export default class CoverImagePlugin extends Plugin {
 		} finally {
 			this.inFlight.delete(file.path);
 		}
+	}
+
+	/* ------------------------ web covers ----------------------------- */
+
+	/**
+	 * Search Douban / Wikipedia for a cover matching the note and save it.
+	 * Single notes show a picker (if enabled); batch runs pick automatically.
+	 * @returns true on success.
+	 */
+	async fetchWebCover(file: TFile, batch = false): Promise<boolean> {
+		if (!this.settings.useDouban && !this.settings.useWikipedia) {
+			new Notice("Enable Douban or Wikipedia in the plugin settings first.");
+			return false;
+		}
+		if (this.inFlight.has(file.path)) {
+			if (!batch) new Notice("A cover is already being processed for this note.");
+			return false;
+		}
+
+		const query = this.buildSearchQuery(file);
+		const kind = this.detectKind(file);
+		const opts = this.searchOptions();
+
+		this.inFlight.add(file.path);
+		let notice: Notice | null = null;
+		try {
+			let choice: CoverCandidate | null | undefined;
+			if (!batch && this.settings.webPickManually) {
+				choice = await new Promise<CoverCandidate | undefined>((resolve) =>
+					new CoverPickerModal(this.app, file.basename, query, kind, opts, resolve).open()
+				);
+				if (!choice) return false; // cancelled
+			} else {
+				if (!batch) notice = new Notice(`Searching cover for "${query}"…`, 0);
+				const results = await searchCovers(query, kind, opts);
+				choice = pickBest(results, query, batch && this.settings.webStrictMatch);
+				if (!choice) {
+					throw new Error(
+						results.length === 0
+							? `nothing found for "${query}" (${KIND_LABELS[kind]})`
+							: `no result matched "${query}" closely enough`
+					);
+				}
+			}
+
+			const picked = choice;
+			if (!notice && !batch) notice = new Notice("Downloading cover…", 0);
+			const image = await downloadImage(picked.fullUrl, picked.referer).catch(() =>
+				// The large variant occasionally doesn't exist; the preview always does.
+				downloadImage(picked.thumbUrl, picked.referer)
+			);
+			const imageFile = await this.saveImage(file, image.data, image.ext);
+			await this.setCoverProperty(file, imageFile);
+			notice?.hide();
+			if (!batch) new Notice(`Cover set for "${file.basename}" from ${picked.source}.`);
+			return true;
+		} catch (err) {
+			notice?.hide();
+			console.error("[Base Cover Image] web cover failed:", err);
+			new Notice(
+				`No web cover for "${file.basename}": ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+				batch ? 4000 : 8000
+			);
+			return false;
+		} finally {
+			this.inFlight.delete(file.path);
+		}
+	}
+
+	private searchOptions(): SearchOptions {
+		return {
+			useDouban: this.settings.useDouban,
+			useWikipedia: this.settings.useWikipedia,
+			wikiLangs: splitList(this.settings.wikiLangs).filter((l) => /^[a-z-]+$/i.test(l)),
+		};
+	}
+
+	/** The note name with prefixes like 【书籍】 and 《》 removed. */
+	private cleanTitle(file: TFile): string {
+		let title = file.basename;
+		if (this.settings.titleCleanup) {
+			try {
+				title = title.replace(new RegExp(this.settings.titleCleanup, "g"), "");
+			} catch {
+				/* invalid regex in settings — use the raw name */
+			}
+		}
+		return title.trim() || file.basename;
+	}
+
+	private buildSearchQuery(file: TFile): string {
+		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+		const q = (this.settings.searchTemplate || "{{title}}")
+			.replace(/\{\{title\}\}/g, this.cleanTitle(file))
+			.replace(/\{\{prop:([^}]+)\}\}/g, (_m, name: string) => {
+				const val = fm[name.trim()];
+				if (val == null) return "";
+				return Array.isArray(val) ? val.join(" ") : String(val);
+			})
+			.replace(/\s+/g, " ")
+			.trim();
+		return q || this.cleanTitle(file);
+	}
+
+	/**
+	 * Decide whether a note is a book, movie or person from its type property,
+	 * its tags and a 【…】 prefix in its name. Falls back to "auto".
+	 */
+	private detectKind(file: TFile): MediaKind {
+		const cache = this.app.metadataCache.getFileCache(file);
+		const hints: string[] = [];
+		const typeVal = cache?.frontmatter?.[this.settings.typeProperty];
+		if (Array.isArray(typeVal)) hints.push(...typeVal.map(String));
+		else if (typeVal != null) hints.push(String(typeVal));
+		hints.push(...getNoteTags(this.app, file));
+		const prefix = file.basename.match(/^【([^】]+)】/);
+		if (prefix) hints.push(prefix[1]);
+
+		const lists: [MediaKind, string][] = [
+			["book", this.settings.bookKeywords],
+			["movie", this.settings.movieKeywords],
+			["person", this.settings.personKeywords],
+		];
+		for (const hint of hints.map((h) => h.toLowerCase().trim())) {
+			for (const [kind, list] of lists) {
+				if (splitList(list).some((k) => k.toLowerCase() === hint)) return kind;
+			}
+		}
+		return "auto";
 	}
 
 	/* --------------------------- prompt ------------------------------- */
@@ -675,6 +944,17 @@ function truthy(v: any): boolean {
 	return Boolean(v);
 }
 
+function splitList(s: string): string[] {
+	return (s ?? "")
+		.split(/[,，]/)
+		.map((x) => x.trim())
+		.filter(Boolean);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((r) => window.setTimeout(r, ms));
+}
+
 function mimeToExt(mime: string): string {
 	switch ((mime || "").toLowerCase()) {
 		case "image/jpeg":
@@ -928,6 +1208,161 @@ class CoverImageSettingTab extends PluginSettingTab {
 							? DEFAULT_SETTINGS.contentLength
 							: Math.max(0, n);
 						await this.plugin.saveSettings();
+					})
+			);
+
+		this.displayWebSettings(containerEl);
+	}
+
+	private displayWebSettings(containerEl: HTMLElement) {
+		const s = this.plugin.settings;
+		const save = () => this.plugin.saveSettings();
+
+		new Setting(containerEl).setName("Web cover search (books, movies, people)").setHeading();
+		containerEl.createEl("p", {
+			cls: "setting-item-description",
+			text:
+				"Find an existing cover (book cover, film poster, portrait) by note name on Douban, " +
+				"with Wikipedia as a fallback. No API key needed. Images are saved with the Storage settings above.",
+		});
+
+		new Setting(containerEl)
+			.setName("Search Douban")
+			.setDesc("Books, movies, TV series and people (豆瓣读书 / 豆瓣电影).")
+			.addToggle((t) =>
+				t.setValue(s.useDouban).onChange(async (v) => {
+					s.useDouban = v;
+					await save();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Search Wikipedia")
+			.setDesc("Good for historical figures and anything Douban lacks. Languages are tried in order.")
+			.addToggle((t) =>
+				t.setValue(s.useWikipedia).onChange(async (v) => {
+					s.useWikipedia = v;
+					await save();
+				})
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("zh, en")
+					.setValue(s.wikiLangs)
+					.onChange(async (v) => {
+						s.wikiLangs = v;
+						await save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Pick from results")
+			.setDesc(
+				"For a single note, show all results as thumbnails to choose from. Off: take the best match automatically. Batch runs always pick automatically."
+			)
+			.addToggle((t) =>
+				t.setValue(s.webPickManually).onChange(async (v) => {
+					s.webPickManually = v;
+					await save();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Search text")
+			.setDesc(
+				"{{title}} = note name after cleanup; {{prop:name}} = a frontmatter property (e.g. {{title}} {{prop:author}})."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("{{title}}")
+					.setValue(s.searchTemplate)
+					.onChange(async (v) => {
+						s.searchTemplate = v;
+						await save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Title cleanup (regex)")
+			.setDesc("Removed from the note name to build {{title}}. Default strips a 【书籍】-style prefix and 《》.")
+			.addText((text) =>
+				text
+					.setPlaceholder(DEFAULT_SETTINGS.titleCleanup)
+					.setValue(s.titleCleanup)
+					.onChange(async (v) => {
+						s.titleCleanup = v;
+						await save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Type property")
+			.setDesc(
+				"Frontmatter property that says what the note is. Its value (or a tag, or a 【…】 name prefix) is matched against the keyword lists below. No match = search everything."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("类型")
+					.setValue(s.typeProperty)
+					.onChange(async (v) => {
+						s.typeProperty = v.trim() || DEFAULT_SETTINGS.typeProperty;
+						await save();
+					})
+			);
+
+		const keywordSetting = (
+			name: string,
+			key: "bookKeywords" | "movieKeywords" | "personKeywords"
+		) =>
+			new Setting(containerEl)
+				.setName(name)
+				.setDesc("Comma-separated values.")
+				.addText((text) =>
+					text.setValue(s[key]).onChange(async (v) => {
+						s[key] = v;
+						await save();
+					})
+				);
+		keywordSetting("Book keywords", "bookKeywords");
+		keywordSetting("Movie / TV keywords", "movieKeywords");
+		keywordSetting("Person keywords", "personKeywords");
+
+		new Setting(containerEl)
+			.setName("Batch: only accept matching titles")
+			.setDesc(
+				"Skip a note when no result's title matches its name, instead of using the top result. Recommended to avoid wrong covers."
+			)
+			.addToggle((t) =>
+				t.setValue(s.webStrictMatch).onChange(async (v) => {
+					s.webStrictMatch = v;
+					await save();
+				})
+			);
+
+		new Setting(containerEl)
+			.setName("Batch: parallel requests")
+			.setDesc("Keep this low — Douban blocks clients that send too many requests.")
+			.addSlider((sl) =>
+				sl
+					.setLimits(1, 4, 1)
+					.setValue(s.webConcurrency)
+					.setDynamicTooltip()
+					.onChange(async (v) => {
+						s.webConcurrency = v;
+						await save();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Batch: delay between notes (ms)")
+			.addText((text) =>
+				text
+					.setPlaceholder("1200")
+					.setValue(String(s.webInterval))
+					.onChange(async (v) => {
+						const n = parseInt(v, 10);
+						s.webInterval = isNaN(n) ? DEFAULT_SETTINGS.webInterval : Math.max(0, n);
+						await save();
 					})
 			);
 	}
